@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 from typing import Tuple, Any, Dict, Optional
 import os
 import sys
@@ -15,7 +16,7 @@ except ImportError:
 
 class NewBieCLIP:
 
-    def __init__(self, text_encoder, tokenizer, clip_model, clip_tokenizer, device="cuda", cpu_offload=False, processor=None, enable_jina_weights=True, weight_baseline_mode="mean"):
+    def __init__(self, text_encoder, tokenizer, clip_model, clip_tokenizer, device="cuda", cpu_offload=False, processor=None, enable_jina_weights=True, weight_baseline_mode="mean", weight_strength=1.0, mask_normalization=True):
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.clip_model = clip_model
@@ -25,7 +26,9 @@ class NewBieCLIP:
         self.cpu_offload = cpu_offload
         self.original_device = device
         self.enable_jina_weights = enable_jina_weights
-        self.weight_baseline_mode = weight_baseline_mode  # "mean" or "empty"
+        self.weight_baseline_mode = weight_baseline_mode  # "mean", "empty", "compel", or "attn_mask"
+        self.weight_strength = weight_strength  # Global weight strength multiplier
+        self.mask_normalization = mask_normalization  # Whether to normalize mask after weight application
         
         self.text_encoder.eval()
         self.clip_model.eval()
@@ -236,7 +239,128 @@ class NewBieCLIP:
             weighted_clip_outputs = []
 
             # Choose baseline mode for Gemma
-            if self.weight_baseline_mode == "mean":
+            if self.weight_baseline_mode == "attn_mask":
+                # Attention mask mode: modify cap_mask for DiT instead of changing embeddings
+                print(f"[NewbieCLIP] 使用注意力掩码模式：保持embeddings不变，通过cap_mask控制DiT的注意力权重")
+
+                # Keep original embeddings unchanged
+                for k in range(real_sections):
+                    weighted_gemma_outputs.append(all_gemma_outputs[k])
+
+                # The mask modification will be done after concatenation
+
+            elif self.weight_baseline_mode == "compel":
+                # Compel mode: use mask to hide tokens instead of removing them
+                print(f"[NewbieCLIP] Using Compel mode with masked attention for aligned interpolation")
+
+                empty_gemma = all_gemma_outputs[-1]  # Empty baseline for weight > 1
+
+                # Process with mask-based weight handling
+                for k in range(real_sections):
+                    gemma_emb = all_gemma_outputs[k].clone()
+                    batch_size = gemma_emb.shape[0]
+                    seq_len = gemma_emb.shape[1]
+
+                    if all_gemma_token_weights[k] is not None:
+                        token_weights = all_gemma_token_weights[k]
+
+                        # Find tokens to mask (weight < 1)
+                        tokens_to_mask = []
+                        for j, w in enumerate(token_weights):
+                            if w < 1.0 and w > 0.0:
+                                tokens_to_mask.append(j)
+
+                        # Generate masked version if needed
+                        if tokens_to_mask:
+                            text, _ = char_weight_spans[k]
+
+                            # Create masked attention mask
+                            original_mask = all_attention_masks[k] if k < len(all_attention_masks) else torch.ones(batch_size, seq_len, dtype=torch.long, device=self.device)
+                            masked_attention = original_mask.clone()
+
+                            # Set mask to 0 for low-weight tokens
+                            for j in tokens_to_mask:
+                                if j < masked_attention.shape[1]:
+                                    masked_attention[:, j] = 0
+
+                            print(f"  Section {k}: Masking {len(tokens_to_mask)} tokens for weight < 1")
+
+                            # Re-encode with masked attention
+                            with torch.no_grad():
+                                tokens = self.tokenizer(
+                                    [text],
+                                    return_tensors="pt",
+                                    padding=True,
+                                    truncation=True,
+                                    max_length=8000
+                                )
+
+                                input_ids = tokens.input_ids.to(self.device)
+
+                                if self.cpu_offload:
+                                    self.text_encoder = self.text_encoder.to(self.original_device)
+
+                                # Encode with masked attention
+                                gemma_outputs = self.text_encoder(
+                                    input_ids=input_ids,
+                                    attention_mask=masked_attention,
+                                    output_hidden_states=True
+                                )
+                                gemma_without = gemma_outputs.hidden_states[-2]
+
+                                if self.cpu_offload:
+                                    self.text_encoder = self.text_encoder.to("cpu")
+                                    torch.cuda.empty_cache()
+
+                            # Verify alignment
+                            if gemma_without.shape[1] != seq_len:
+                                print(f"  Warning: Shape mismatch, padding/truncating")
+                                if gemma_without.shape[1] < seq_len:
+                                    pad_size = seq_len - gemma_without.shape[1]
+                                    gemma_without = torch.cat([gemma_without, gemma_without[:, -1:].expand(-1, pad_size, -1)], dim=1)
+                                else:
+                                    gemma_without = gemma_without[:, :seq_len]
+
+                            # Apply interpolation with aligned positions
+                            for i in range(batch_size):
+                                for j in range(min(seq_len, len(token_weights))):
+                                    weight = token_weights[j]
+                                    if weight != 1.0:
+                                        if weight < 1.0 and weight > 0:
+                                            # Positions are aligned!
+                                            alpha = weight ** 0.7  # Smoother curve
+                                            gemma_emb[i, j] = gemma_emb[i, j] * alpha + gemma_without[i, j] * (1 - alpha)
+                                        elif weight <= 0:
+                                            gemma_emb[i, j] = gemma_without[i, j]
+                                        else:
+                                            # weight > 1
+                                            empty_token = empty_gemma[i, 0] if empty_gemma.shape[1] > 0 else torch.zeros_like(gemma_emb[i, j])
+                                            scale = weight ** 0.8
+                                            gemma_emb[i, j] = (gemma_emb[i, j] - empty_token) * scale + empty_token
+                        else:
+                            # No low-weight tokens, only handle weight > 1
+                            for i in range(batch_size):
+                                for j in range(min(seq_len, len(token_weights))):
+                                    weight = token_weights[j]
+                                    if weight > 1.0:
+                                        empty_token = empty_gemma[i, 0] if empty_gemma.shape[1] > 0 else torch.zeros_like(gemma_emb[i, j])
+                                        gemma_emb[i, j] = (gemma_emb[i, j] - empty_token) * weight + empty_token
+                    else:
+                        # Fallback when no aligned weights available
+                        for i in range(batch_size):
+                            for j in range(min(seq_len, len(token_weights_list[k]))):
+                                weight = token_weights_list[k][j]
+                                if weight != 1.0:
+                                    if weight > 1.0:
+                                        empty_token = empty_gemma[i, 0] if empty_gemma.shape[1] > 0 else torch.zeros_like(gemma_emb[i, j])
+                                        gemma_emb[i, j] = (gemma_emb[i, j] - empty_token) * weight + empty_token
+                                    # For weight < 1 in fallback, just scale down
+                                    else:
+                                        gemma_emb[i, j] = gemma_emb[i, j] * weight
+
+                    weighted_gemma_outputs.append(gemma_emb)
+
+            elif self.weight_baseline_mode == "mean":
                 # Mean baseline mode: generate unweighted baseline
                 print(f"[NewbieCLIP] Gemma使用均值baseline模式")
                 unweighted_gemma_outputs = []
@@ -418,6 +542,8 @@ class NewBieCLIP:
         if has_weights:
             if self.weight_baseline_mode == "mean":
                 print(f"  - Gemma: 使用均值相对缩放 (emb_ref - μ) * w + μ")
+            elif self.weight_baseline_mode == "compel":
+                print(f"  - Gemma: Compel模式 (w<1: tan插值到无权重, w>1: 空baseline放大)")
             else:
                 print(f"  - Gemma: 使用空字符串baseline插值")
             print(f"  - CLIP: 使用空字符串baseline插值")
@@ -599,7 +725,7 @@ class NewBieCLIP:
 
             if self.enable_jina_weights and hasattr(self.clip_model, '_last_hidden_states') and self.clip_model._last_hidden_states is not None:
                 clip_text_embeddings = self.clip_model._last_hidden_states
-                print(f"[NewbieCLIP] Jina CLIP: 使用hook获取token embeddings, shape={clip_text_embeddings.shape}")
+                print(f"[NewbieCLIP] Jina CLIP: Using hook to capture token embeddings, shape={clip_text_embeddings.shape}")
             elif not self.enable_jina_weights:
                 print(f"[NewbieCLIP] Jina权重处理已禁用")
 
@@ -688,7 +814,7 @@ class NewBieCLIP:
 
             if self.enable_jina_weights and hasattr(self.clip_model, '_last_hidden_states') and self.clip_model._last_hidden_states is not None:
                 clip_text_embeddings = self.clip_model._last_hidden_states
-                print(f"[NewbieCLIP] Jina CLIP: 使用hook获取token embeddings, shape={clip_text_embeddings.shape}")
+                print(f"[NewbieCLIP] Jina CLIP: Using hook to capture token embeddings, shape={clip_text_embeddings.shape}")
 
             result = {
                 "cap_feats": cap_feats,
@@ -870,9 +996,20 @@ class NewBieCLIPLoader:
                     "default": True,
                     "description": "Enable weight processing for Jina CLIP (requires more memory)"
                 }),
-                "weight_baseline_mode": (["mean", "empty"], {
+                "weight_baseline_mode": (["mean", "empty", "compel", "attn_bias", "hybrid"], {
                     "default": "mean",
-                    "description": "Weight baseline mode for Gemma: 'mean' for context-aware scaling, 'empty' for traditional"
+                    "description": "Weight baseline mode: 'mean' for context-aware, 'empty' for traditional, 'compel' for advanced, 'attn_bias' for attention-based, 'hybrid' for combined approach"
+                }),
+                "weight_strength": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 2.0,
+                    "step": 0.1,
+                    "description": "Global weight strength multiplier (0=no effect, 1=normal, 2=double strength)"
+                }),
+                "mask_normalization": ("BOOLEAN", {
+                    "default": True,
+                    "description": "Normalize attention mask after weight application to maintain distribution"
                 }),
             }
         }
@@ -1057,7 +1194,9 @@ class NewBieCLIPLoader:
         dtype: str = "bf16",
         cpu_offload: bool = False,
         enable_jina_weights: bool = True,
-        weight_baseline_mode: str = "mean"
+        weight_baseline_mode: str = "mean",
+        weight_strength: float = 1.0,
+        mask_normalization: bool = True
     ) -> Tuple[Any,]:
         dtype_map = {
             "bf16": torch.bfloat16,
@@ -1088,7 +1227,9 @@ class NewBieCLIPLoader:
             cpu_offload=cpu_offload,
             processor=processor,
             enable_jina_weights=enable_jina_weights,
-            weight_baseline_mode=weight_baseline_mode
+            weight_baseline_mode=weight_baseline_mode,
+            weight_strength=weight_strength,
+            mask_normalization=mask_normalization
         )
         
         return (newbie_clip,)
