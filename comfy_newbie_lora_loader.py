@@ -24,24 +24,42 @@ def _get_model_state_dict(model: typing.Any) -> dict:
 def build_newbie_lora_key_map(model) -> dict:
     sd = _get_model_state_dict(model)
     key_map = {}
+
     for full_key in sd.keys():
         if not full_key.endswith(".weight"):
             continue
-        base = full_key[:-len(".weight")]
+
+        # 原始权重键，比如 "diffusion_model.layers.0.attention.qkv.weight"
+        base = full_key[:-len(".weight")]  # -> "diffusion_model.layers.0.attention.qkv"
+
         variants = set()
+
+        # 1. 原始名字 + 常见前缀（兼容原来 LoRA）
         variants.add(base)
         variants.add("base_model.model." + base)
         variants.add("transformer." + base)
+
+        short = None
         if base.startswith("diffusion_model."):
-            short = base[len("diffusion_model."):]
+            short = base[len("diffusion_model."):]  # 去掉 diffusion_model. 前缀
             variants.add(short)
             variants.add("base_model.model." + short)
             variants.add("transformer." + short)
             variants.add("unet.base_model.model." + short)
+        lyco_names = ["lycoris_" + base.replace(".", "_")]
+        if short is not None:
+            lyco_names.append("lycoris_" + short.replace(".", "_"))
+
+        for name in lyco_names:
+            variants.add(name)
+
+        # 去重填入 key_map
         for v in variants:
             if v not in key_map:
                 key_map[v] = full_key
+
     return key_map
+
 
 
 def estimate_lora_rank(lora_sd: dict) -> typing.Optional[float]:
