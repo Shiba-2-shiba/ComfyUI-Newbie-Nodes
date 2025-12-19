@@ -16,7 +16,7 @@ except ImportError:
 
 class NewBieCLIP:
 
-    def __init__(self, text_encoder, tokenizer, clip_model, clip_tokenizer, device="cuda", cpu_offload=False, processor=None, enable_jina_weights=True, weight_baseline_mode="compel", weight_strength=1.0, mask_normalization=True):
+    def __init__(self, text_encoder, tokenizer, clip_model, clip_tokenizer, device="cuda", cpu_offload=False, processor=None, enable_jina_weights=True, weight_baseline_mode="mean", weight_strength=1.0, mask_normalization=True):
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.clip_model = clip_model
@@ -26,9 +26,9 @@ class NewBieCLIP:
         self.cpu_offload = cpu_offload
         self.original_device = device
         self.enable_jina_weights = enable_jina_weights
-        self.weight_baseline_mode = weight_baseline_mode  # "mean", "empty", "compel", or "attn_mask"
-        self.weight_strength = weight_strength  # Global weight strength multiplier
-        self.mask_normalization = mask_normalization  # Whether to normalize mask after weight application
+        self.weight_baseline_mode = weight_baseline_mode
+        self.weight_strength = weight_strength
+        self.mask_normalization = mask_normalization
         
         self.text_encoder.eval()
         self.clip_model.eval()
@@ -37,14 +37,23 @@ class NewBieCLIP:
             self.text_encoder = self.text_encoder.to("cpu")
             self.clip_model = self.clip_model.to("cpu")
             torch.cuda.empty_cache()
-    
+
+    def _move_to_device(self):
+        if self.cpu_offload:
+            self.text_encoder = self.text_encoder.to(self.original_device)
+            self.clip_model = self.clip_model.to(self.original_device)
+
+    def _move_to_cpu(self):
+        if self.cpu_offload:
+            self.text_encoder = self.text_encoder.to("cpu")
+            self.clip_model = self.clip_model.to("cpu")
+            torch.cuda.empty_cache()
+
     def encode_from_tokens(self, tokens, return_pooled=False):
         if isinstance(tokens, list) and tokens and isinstance(tokens[0], tuple):
             return self.encode_token_weights([tokens])
         
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to(self.original_device)
-            self.clip_model = self.clip_model.to(self.original_device)
+        self._move_to_device()
         
         if isinstance(tokens, str):
             tokens = self.tokenize(tokens)
@@ -54,27 +63,20 @@ class NewBieCLIP:
                 input_ids = tokens.input_ids
                 attention_mask = tokens.attention_mask
             else:
-                # 如果直接传入token ids
                 input_ids = tokens
                 attention_mask = torch.ones_like(input_ids)
             
-            # 1. Gemma编码 - 主要的交叉注意力特征
             gemma_outputs = self.text_encoder(
                 input_ids=input_ids.to(self.device),
                 attention_mask=attention_mask.to(self.device),
                 output_hidden_states=True,
             )
-            # 使用倒数第二层作为主要特征 (cap_feats)
             cap_feats = gemma_outputs.hidden_states[-2]
             
-            # 2. CLIP编码 - 用于时间嵌入的池化特征
-            # 重新tokenize用于CLIP（因为tokenizer可能不同）
             batch_size = input_ids.shape[0]
-            # 简化处理：使用相同的文本
             if hasattr(self, '_last_text'):
                 clip_text = self._last_text
             else:
-                # 从tokens恢复文本（简化版本）
                 clip_text = [""] * batch_size
             
             clip_inputs = self.clip_tokenizer(
@@ -85,33 +87,20 @@ class NewBieCLIP:
                 max_length=8000
             ).to(self.device)
             
-            # Get pooled features - hook will capture hidden states if needed
-            clip_text_embeddings = None  # Will be set by hook if available
             clip_text_pooled = self.clip_model.get_text_features(input_ids=clip_inputs.input_ids)
             
-            # 3. 创建NextDiT兼容的条件字典，符合ComfyUI格式
             extra_conds = {
                 "cap_feats": cap_feats,
                 "cap_mask": attention_mask.to(self.device),
                 "clip_text_pooled": clip_text_pooled,
+                "pooled_output": clip_text_pooled,
             }
             
-            if return_pooled:
-                result = ([[cap_feats, extra_conds]], clip_text_pooled)
-                if self.cpu_offload:
-                    self.text_encoder = self.text_encoder.to("cpu")
-                    self.clip_model = self.clip_model.to("cpu")
-                    torch.cuda.empty_cache()
-                return result
-            
-            # ComfyUI标准格式: [[features, extra_dict]]
             result = [[cap_feats, extra_conds]]
+            if return_pooled:
+                result = (result, clip_text_pooled)
         
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to("cpu")
-            self.clip_model = self.clip_model.to("cpu")
-            torch.cuda.empty_cache()
-        
+        self._move_to_cpu()
         return result
     
     def encode_text(self, text):
@@ -123,84 +112,77 @@ class NewBieCLIP:
         return self.encode_from_tokens(tokens, return_pooled)
     
     def encode_token_weights(self, token_weight_pairs):
+        self._move_to_device()
+
         to_encode = []
         token_weights_list = []
-        char_weight_spans = []  # Store character-level weight spans
+        char_weight_spans = []
         max_token_len = 0
         has_weights = False
 
-        print(f"\n[NewbieCLIP] ===== 开始权重处理 =====")
+        print(f"\n[NewbieCLIP] ===== 开始权重处理 (Optimized) =====")
 
-        # Parse weight spans from token_weight_pairs
         for x in token_weight_pairs:
             tokens = [a[0] for a in x]
             weights = [a[1] for a in x]
 
-            # Reconstruct text and build character-level weight mapping
             text = " ".join(str(t) for t in tokens if str(t))
             text = text.replace('\x00\x02', '(').replace('\x00\x01', ')')
 
-            # Build character spans with weights
             char_weights = []
             current_pos = 0
             for i, (token, weight) in enumerate(x):
                 token_str = str(token).replace('\x00\x02', '(').replace('\x00\x01', ')')
-                if token_str:  # Skip empty tokens
+                if token_str:
                     end_pos = current_pos + len(token_str)
                     char_weights.append((current_pos, end_pos, weight))
                     current_pos = end_pos
-                    # Add space only if not last token and next token is not empty
                     if i < len(x) - 1:
                         next_token = str(x[i+1][0]).replace('\x00\x02', '(').replace('\x00\x01', ')')
                         if next_token:
-                            current_pos += 1  # +1 for space
+                            current_pos += 1
 
             char_weight_spans.append((text, char_weights))
 
             section_weights = [a for a in x if a[1] != 1.0]
             if section_weights:
-                print(f"[NewbieCLIP] 检测到权重: {len(section_weights)}个token带权重")
-                for token, weight in section_weights[:3]:
-                    clean_token = str(token).replace('\x00\x02', '(').replace('\x00\x01', ')')
-                    print(f"  - {clean_token}: {weight:.2f}")
-                if len(section_weights) > 3:
-                    print(f"  ... 还有{len(section_weights)-3}个token带权重")
+                has_weights = True
 
-            has_weights = has_weights or bool(section_weights)
             max_token_len = max(len(tokens), max_token_len)
             to_encode.append(tokens)
             token_weights_list.append(weights)
 
-        # Count real sections before adding empty
         real_sections = len(to_encode)
 
-        # Add empty section for weight interpolation if needed
         if has_weights or real_sections == 0:
             to_encode.append([""] * max_token_len)
             token_weights_list.append([1.0] * max_token_len)
             char_weight_spans.append(("", []))
 
-        # Total sections including empty
-        total_sections = len(to_encode)
-
         all_gemma_outputs = []
         all_clip_embeddings = []
         all_pooled = []
         all_attention_masks = []
-        all_gemma_token_weights = []  # Store aligned token weights for Gemma
-        all_clip_token_weights = []   # Store aligned token weights for Jina
+        all_gemma_token_weights = []
+        all_clip_token_weights = []
 
         original_prompt = getattr(self, '_original_prompt', None)
 
         for i, (text, char_weights) in enumerate(char_weight_spans):
-            if i == 0 and original_prompt:
-                result = self._encode_text_direct_weighted_with_offsets(
-                    text, char_weights, original_text=original_prompt
-                )
-            else:
-                result = self._encode_text_direct_weighted_with_offsets(
-                    text, char_weights
-                )
+            temp_offload = self.cpu_offload
+            self.cpu_offload = False 
+            
+            try:
+                if i == 0 and original_prompt:
+                    result = self._encode_text_direct_weighted_with_offsets(
+                        text, char_weights, original_text=original_prompt
+                    )
+                else:
+                    result = self._encode_text_direct_weighted_with_offsets(
+                        text, char_weights
+                    )
+            finally:
+                self.cpu_offload = temp_offload
 
             if isinstance(result, dict):
                 cap_feats = result['cap_feats']
@@ -210,18 +192,11 @@ class NewBieCLIP:
                 gemma_token_weights = result.get('gemma_token_weights')
                 clip_token_weights = result.get('clip_token_weights')
             else:
-                # Fallback for old format
-                if isinstance(result, list) and result:
-                    cap_feats = result[0][0]
-                    extra_dict = result[0][1]
-                    pooled = extra_dict.get("clip_text_pooled")
-                    clip_embeddings = extra_dict.get("clip_text_embeddings")
-                    attention_mask = extra_dict.get("cap_mask")
-                else:
-                    cap_feats = result
-                    pooled = None
-                    clip_embeddings = None
-                    attention_mask = None
+                cap_feats = result[0][0]
+                extra_dict = result[0][1]
+                pooled = extra_dict.get("clip_text_pooled")
+                clip_embeddings = extra_dict.get("clip_text_embeddings")
+                attention_mask = extra_dict.get("cap_mask")
                 gemma_token_weights = None
                 clip_token_weights = None
 
@@ -238,190 +213,66 @@ class NewBieCLIP:
             weighted_gemma_outputs = []
             weighted_clip_outputs = []
 
-            # Choose baseline mode for Gemma
-            if self.weight_baseline_mode == "attn_mask":
-                # Attention mask mode: modify cap_mask for DiT instead of changing embeddings
-                print(f"[NewbieCLIP] 使用注意力掩码模式：保持embeddings不变，通过cap_mask控制DiT的注意力权重")
-
-                # Keep original embeddings unchanged
+            if self.weight_baseline_mode == "mean":
+                print(f"[NewbieCLIP] Gemma使用均值baseline模式 (Optimized)")
                 for k in range(real_sections):
-                    weighted_gemma_outputs.append(all_gemma_outputs[k])
+                    gemma_emb = all_gemma_outputs[k].clone()
+                    unweighted_gemma = all_gemma_outputs[k]
 
-                # The mask modification will be done after concatenation
+                    batch_size = gemma_emb.shape[0]
+                    seq_len = gemma_emb.shape[1]
+
+                    context_mean = unweighted_gemma.mean(dim=1, keepdim=True)
+
+                    if all_gemma_token_weights[k] is not None:
+                        token_weights = all_gemma_token_weights[k]
+                        for i in range(batch_size):
+                            for j in range(min(seq_len, len(token_weights))):
+                                weight = token_weights[j]
+                                if weight != 1.0:
+                                    gemma_emb[i, j] = (unweighted_gemma[i, j] - context_mean[i, 0]) * weight + context_mean[i, 0]
+                    else:
+                        for i in range(batch_size):
+                            for j in range(min(seq_len, len(token_weights_list[k]))):
+                                weight = token_weights_list[k][j]
+                                if weight != 1.0:
+                                    gemma_emb[i, j] = (unweighted_gemma[i, j] - context_mean[i, 0]) * weight + context_mean[i, 0]
+
+                    weighted_gemma_outputs.append(gemma_emb)
 
             elif self.weight_baseline_mode == "compel":
-                # Compel mode: use mask to hide tokens instead of removing them
-                print(f"[NewbieCLIP] Using Compel mode with masked attention for aligned interpolation")
-
-                empty_gemma = all_gemma_outputs[-1]  # Empty baseline for weight > 1
-
-                # Process with mask-based weight handling
+                print(f"[NewbieCLIP] Using Compel mode")
+                empty_gemma = all_gemma_outputs[-1]
                 for k in range(real_sections):
                     gemma_emb = all_gemma_outputs[k].clone()
                     batch_size = gemma_emb.shape[0]
                     seq_len = gemma_emb.shape[1]
-
-                    if all_gemma_token_weights[k] is not None:
-                        token_weights = all_gemma_token_weights[k]
-
-                        # Find tokens to mask (weight < 1)
-                        tokens_to_mask = []
-                        for j, w in enumerate(token_weights):
-                            if w < 1.0 and w > 0.0:
-                                tokens_to_mask.append(j)
-
-                        # Generate masked version if needed
-                        if tokens_to_mask:
-                            text, _ = char_weight_spans[k]
-
-                            # Create masked attention mask
-                            original_mask = all_attention_masks[k] if k < len(all_attention_masks) else torch.ones(batch_size, seq_len, dtype=torch.long, device=self.device)
-                            masked_attention = original_mask.clone()
-
-                            # Set mask to 0 for low-weight tokens
-                            for j in tokens_to_mask:
-                                if j < masked_attention.shape[1]:
-                                    masked_attention[:, j] = 0
-
-                            print(f"  Section {k}: Masking {len(tokens_to_mask)} tokens for weight < 1")
-
-                            # Re-encode with masked attention
-                            with torch.no_grad():
-                                tokens = self.tokenizer(
-                                    [text],
-                                    return_tensors="pt",
-                                    padding=True,
-                                    truncation=True,
-                                    max_length=8000
-                                )
-
-                                input_ids = tokens.input_ids.to(self.device)
-
-                                if self.cpu_offload:
-                                    self.text_encoder = self.text_encoder.to(self.original_device)
-
-                                # Encode with masked attention
-                                gemma_outputs = self.text_encoder(
-                                    input_ids=input_ids,
-                                    attention_mask=masked_attention,
-                                    output_hidden_states=True
-                                )
-                                gemma_without = gemma_outputs.hidden_states[-2]
-
-                                if self.cpu_offload:
-                                    self.text_encoder = self.text_encoder.to("cpu")
-                                    torch.cuda.empty_cache()
-
-                            # Verify alignment
-                            if gemma_without.shape[1] != seq_len:
-                                print(f"  Warning: Shape mismatch, padding/truncating")
-                                if gemma_without.shape[1] < seq_len:
-                                    pad_size = seq_len - gemma_without.shape[1]
-                                    gemma_without = torch.cat([gemma_without, gemma_without[:, -1:].expand(-1, pad_size, -1)], dim=1)
-                                else:
-                                    gemma_without = gemma_without[:, :seq_len]
-
-                            # Apply interpolation with aligned positions
-                            for i in range(batch_size):
-                                for j in range(min(seq_len, len(token_weights))):
-                                    weight = token_weights[j]
-                                    if weight != 1.0:
-                                        if weight < 1.0 and weight > 0:
-                                            # Positions are aligned!
-                                            alpha = weight ** 0.7  # Smoother curve
-                                            gemma_emb[i, j] = gemma_emb[i, j] * alpha + gemma_without[i, j] * (1 - alpha)
-                                        elif weight <= 0:
-                                            gemma_emb[i, j] = gemma_without[i, j]
-                                        else:
-                                            # weight > 1
-                                            empty_token = empty_gemma[i, 0] if empty_gemma.shape[1] > 0 else torch.zeros_like(gemma_emb[i, j])
-                                            scale = weight ** 0.8
-                                            gemma_emb[i, j] = (gemma_emb[i, j] - empty_token) * scale + empty_token
-                        else:
-                            # No low-weight tokens, only handle weight > 1
-                            for i in range(batch_size):
-                                for j in range(min(seq_len, len(token_weights))):
-                                    weight = token_weights[j]
-                                    if weight > 1.0:
-                                        empty_token = empty_gemma[i, 0] if empty_gemma.shape[1] > 0 else torch.zeros_like(gemma_emb[i, j])
-                                        gemma_emb[i, j] = (gemma_emb[i, j] - empty_token) * weight + empty_token
-                    else:
-                        # Fallback when no aligned weights available
-                        for i in range(batch_size):
-                            for j in range(min(seq_len, len(token_weights_list[k]))):
-                                weight = token_weights_list[k][j]
-                                if weight != 1.0:
-                                    if weight > 1.0:
-                                        empty_token = empty_gemma[i, 0] if empty_gemma.shape[1] > 0 else torch.zeros_like(gemma_emb[i, j])
-                                        gemma_emb[i, j] = (gemma_emb[i, j] - empty_token) * weight + empty_token
-                                    # For weight < 1 in fallback, just scale down
-                                    else:
-                                        gemma_emb[i, j] = gemma_emb[i, j] * weight
-
-                    weighted_gemma_outputs.append(gemma_emb)
-
-            elif self.weight_baseline_mode == "mean":
-                # Mean baseline mode: generate unweighted baseline
-                print(f"[NewbieCLIP] Gemma使用均值baseline模式")
-                unweighted_gemma_outputs = []
-
-                # Generate unweighted versions (all weights = 1.0)
-                for i, (text, _) in enumerate(char_weight_spans[:real_sections]):
-                    # Use the same text but without weights
-                    result = self._encode_text_direct_weighted_with_offsets(text, [])
-
-                    if isinstance(result, dict):
-                        unweighted_gemma = result['cap_feats']
-                    else:
-                        # Fallback
-                        unweighted_gemma = all_gemma_outputs[i]
-
-                    unweighted_gemma_outputs.append(unweighted_gemma)
-
-                # Process with mean baseline
-                for k in range(real_sections):
-                    gemma_emb = all_gemma_outputs[k].clone()
-                    unweighted_gemma = unweighted_gemma_outputs[k]
-
-                    batch_size = gemma_emb.shape[0]
-                    seq_len = gemma_emb.shape[1]
-
-                    # Calculate context mean μ for this section
-                    context_mean = unweighted_gemma.mean(dim=1, keepdim=True)  # [batch_size, 1, hidden_dim]
-
-                    # Apply mean-relative scaling for Gemma
-                    # emb' = (emb_ref - μ) * w + μ
+                    
                     if all_gemma_token_weights[k] is not None:
                         token_weights = all_gemma_token_weights[k]
                         for i in range(batch_size):
                             for j in range(min(seq_len, len(token_weights))):
                                 weight = token_weights[j]
-                                if weight != 1.0:
-                                    # Mean-relative scaling
-                                    gemma_emb[i, j] = (unweighted_gemma[i, j] - context_mean[i, 0]) * weight + context_mean[i, 0]
-                    else:
-                        # Fallback to old method with token_weights_list
-                        for i in range(batch_size):
-                            for j in range(min(seq_len, len(token_weights_list[k]))):
-                                weight = token_weights_list[k][j]
-                                if weight != 1.0:
-                                    # Mean-relative scaling
-                                    gemma_emb[i, j] = (unweighted_gemma[i, j] - context_mean[i, 0]) * weight + context_mean[i, 0]
-
+                                if weight > 1.0:
+                                    empty_token = empty_gemma[i, 0] if empty_gemma.shape[1] > 0 else torch.zeros_like(gemma_emb[i, j])
+                                    gemma_emb[i, j] = (gemma_emb[i, j] - empty_token) * weight + empty_token
+                                elif weight < 1.0:
+                                    gemma_emb[i, j] = gemma_emb[i, j] * weight
                     weighted_gemma_outputs.append(gemma_emb)
 
-            else:  # empty baseline mode
+            elif self.weight_baseline_mode == "attn_mask":
+                 for k in range(real_sections):
+                    weighted_gemma_outputs.append(all_gemma_outputs[k])
+
+            else:
                 print(f"[NewbieCLIP] Gemma使用空字符串baseline模式")
-                empty_gemma = all_gemma_outputs[-1]  # Last one is empty
+                empty_gemma = all_gemma_outputs[-1]
 
-                # Process with empty baseline
                 for k in range(real_sections):
                     gemma_emb = all_gemma_outputs[k].clone()
-
                     batch_size = gemma_emb.shape[0]
                     seq_len = gemma_emb.shape[1]
 
-                    # Apply empty baseline interpolation
                     if all_gemma_token_weights[k] is not None:
                         token_weights = all_gemma_token_weights[k]
                         for i in range(batch_size):
@@ -431,7 +282,6 @@ class NewBieCLIP:
                                     empty_token = empty_gemma[i, 0] if empty_gemma.shape[1] > 0 else torch.zeros_like(gemma_emb[i, j])
                                     gemma_emb[i, j] = (gemma_emb[i, j] - empty_token) * weight + empty_token
                     else:
-                        # Fallback to old method with token_weights_list
                         for i in range(batch_size):
                             for j in range(min(seq_len, len(token_weights_list[k]))):
                                 weight = token_weights_list[k][j]
@@ -441,39 +291,33 @@ class NewBieCLIP:
 
                     weighted_gemma_outputs.append(gemma_emb)
 
-                if self.enable_jina_weights and all_clip_embeddings[k] is not None:
+            if self.enable_jina_weights and all_clip_embeddings and all_clip_embeddings[0] is not None:
+                 for k in range(real_sections):
+                    if k >= len(all_clip_embeddings): break
                     clip_emb = all_clip_embeddings[k].clone()
                     empty_clip = all_clip_embeddings[-1] if all_clip_embeddings[-1] is not None else torch.zeros_like(clip_emb)
-
-                    # Use aligned token weights if available
-                    if all_clip_token_weights[k] is not None:
-                        token_weights = all_clip_token_weights[k]
-                        for i in range(clip_emb.shape[0]):
-                            for j in range(min(clip_emb.shape[1], len(token_weights))):
-                                weight = token_weights[j]
-                                if weight != 1.0:
-                                    empty_token = empty_clip[i, 0] if empty_clip.shape[1] > 0 else torch.zeros_like(clip_emb[i, j])
-                                    clip_emb[i, j] = (clip_emb[i, j] - empty_token) * weight + empty_token
-                    else:
-                        # Fallback to old method
-                        for i in range(clip_emb.shape[0]):
-                            for j in range(min(clip_emb.shape[1], len(token_weights_list[k]))):
-                                weight = token_weights_list[k][j]
-                                if weight != 1.0:
-                                    empty_token = empty_clip[i, 0] if empty_clip.shape[1] > 0 else torch.zeros_like(clip_emb[i, j])
-                                    clip_emb[i, j] = (clip_emb[i, j] - empty_token) * weight + empty_token
+                    
+                    token_weights = all_clip_token_weights[k] if all_clip_token_weights[k] is not None else token_weights_list[k]
+                    
+                    for i in range(clip_emb.shape[0]):
+                        for j in range(min(clip_emb.shape[1], len(token_weights))):
+                            weight = token_weights[j]
+                            if weight != 1.0:
+                                empty_token = empty_clip[i, 0] if empty_clip.shape[1] > 0 else torch.zeros_like(clip_emb[i, j])
+                                clip_emb[i, j] = (clip_emb[i, j] - empty_token) * weight + empty_token
                     weighted_clip_outputs.append(clip_emb)
-                else:
-                    weighted_clip_outputs.append(all_clip_embeddings[k])
+            else:
+                for k in range(real_sections):
+                    if k < len(all_clip_embeddings):
+                        weighted_clip_outputs.append(all_clip_embeddings[k])
 
-            # Concatenate all real weighted outputs (no need to exclude anything)
+
             if len(weighted_gemma_outputs) > 1:
                 final_gemma = torch.cat(weighted_gemma_outputs, dim=1)
             else:
                 final_gemma = weighted_gemma_outputs[0] if weighted_gemma_outputs else all_gemma_outputs[0]
 
             mask_list = []
-            # Build mask for real sections only
             for k in range(real_sections):
                 if k < len(all_attention_masks) and all_attention_masks[k] is not None:
                     mask_list.append(all_attention_masks[k])
@@ -481,88 +325,33 @@ class NewBieCLIP:
                     batch_size = weighted_gemma_outputs[k].shape[0]
                     seq_len = weighted_gemma_outputs[k].shape[1]
                     mask_list.append(torch.ones(batch_size, seq_len, dtype=torch.long, device=self.device))
-
+            
             final_attention_mask = torch.cat(mask_list, dim=1) if len(mask_list) > 1 else mask_list[0] if mask_list else None
 
             if weighted_clip_outputs and weighted_clip_outputs[0] is not None:
-                # Concatenate all real weighted clip outputs
                 clip_to_concat = [c for c in weighted_clip_outputs if c is not None]
-                weighted_clip_concat = torch.cat(clip_to_concat, dim=1) if len(clip_to_concat) > 1 else clip_to_concat[0] if clip_to_concat else None
-
-                if weighted_clip_concat is not None:
-                    # Use aligned clip token weights if available
-                    if any(w is not None for w in all_clip_token_weights[:real_sections]):
-                        weight_list = []
-                        for k in range(real_sections):
-                            if k < len(all_clip_token_weights) and all_clip_token_weights[k] is not None:
-                                weight_list.extend(all_clip_token_weights[k])
-                            elif k < len(token_weights_list):
-                                # Fallback to original weights
-                                weight_list.extend(token_weights_list[k][:len(token_weights_list[k])])
-                    else:
-                        # Fallback to original method
-                        weight_list = []
-                        for k in range(real_sections):
-                            if k < len(token_weights_list):
-                                weight_list.extend(token_weights_list[k][:len(token_weights_list[k])])
-
-                    weight_tensor = torch.tensor(
-                        weight_list[:weighted_clip_concat.shape[1]],  # Ensure correct length
-                        dtype=weighted_clip_concat.dtype,
-                        device=weighted_clip_concat.device
-                    )
-
-                    # Pad if necessary
-                    if len(weight_tensor) < weighted_clip_concat.shape[1]:
-                        padding = torch.ones(
-                            weighted_clip_concat.shape[1] - len(weight_tensor),
-                            dtype=weight_tensor.dtype,
-                            device=weight_tensor.device
-                        )
-                        weight_tensor = torch.cat([weight_tensor, padding])
-
-                    weight_tensor = weight_tensor.unsqueeze(0).unsqueeze(-1)
-                    weight_tensor = weight_tensor.expand_as(weighted_clip_concat)
-
-                    weighted_sum = (weighted_clip_concat * weight_tensor).sum(dim=1)
-                    weight_sum = weight_tensor.sum(dim=1).squeeze(-1)
-                    clip_pooled_final = weighted_sum / (weight_sum + 1e-8)
+                if clip_to_concat:
+                    weighted_clip_concat = torch.cat(clip_to_concat, dim=1) if len(clip_to_concat) > 1 else clip_to_concat[0]
+                    clip_pooled_final = weighted_clip_concat.mean(dim=1) 
                 else:
-                    clip_pooled_final = all_pooled[0] if all_pooled[0] is not None else None
-                print(f"[NewbieCLIP] Jina CLIP: 使用加权池化")
+                    clip_pooled_final = all_pooled[0]
             else:
-                clip_pooled_final = all_pooled[0] if all_pooled[0] is not None else None
+                clip_pooled_final = all_pooled[0]
+
         else:
             final_gemma = all_gemma_outputs[0] if all_gemma_outputs else None
             final_attention_mask = all_attention_masks[0] if all_attention_masks else None
             clip_pooled_final = all_pooled[0] if all_pooled else None
 
-
         print(f"[NewbieCLIP] 权重处理完成")
-        if has_weights:
-            if self.weight_baseline_mode == "mean":
-                print(f"  - Gemma: 使用均值相对缩放 (emb_ref - μ) * w + μ")
-            elif self.weight_baseline_mode == "compel":
-                print(f"  - Gemma: Compel模式 (w<1: tan插值到无权重, w>1: 空baseline放大)")
-            else:
-                print(f"  - Gemma: 使用空字符串baseline插值")
-            print(f"  - CLIP: 使用空字符串baseline插值")
-        print(f"  - Gemma输出: shape={final_gemma.shape if final_gemma is not None else 'None'}")
-        print(f"  - Attention mask: shape={final_attention_mask.shape if final_attention_mask is not None else 'None'}")
-        print(f"  - Jina pooled: shape={clip_pooled_final.shape if clip_pooled_final is not None else 'None'}")
-        print(f"[NewbieCLIP] ===== 权重处理结束 =====\n")
+        self._move_to_cpu()
 
         extra_conds = {
             "cap_feats": final_gemma,
             "cap_mask": final_attention_mask,
             "clip_text_pooled": clip_pooled_final,
+            "pooled_output": clip_pooled_final,
         }
-
-        # Final safety check: ensure models are offloaded if cpu_offload is enabled
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to("cpu")
-            self.clip_model = self.clip_model.to("cpu")
-            torch.cuda.empty_cache()
 
         return [[final_gemma, extra_conds]]
     
@@ -588,40 +377,32 @@ class NewBieCLIP:
         text = text.replace('\\)', '<<<ESC_RPAREN>>>')
         def process_brackets(text):
             pattern = r'\[+([^\[\]]*(?:<<<ESC_[LR]BRACKET>>>[^\[\]]*)*)\]+'
-            
             def replace_brackets(match):
                 full_match = match.group(0)
                 content = match.group(1)
-                
                 left_count = 0
                 i = 0
                 while i < len(full_match) and full_match[i] == '[':
                     left_count += 1
                     i += 1
-                
                 weight = 0.9 ** left_count
                 return f"({content}:{weight:.3f})"
-            
             while re.search(pattern, text):
                 text = re.sub(pattern, replace_brackets, text)
             return text
         
         def process_braces(text):
             pattern = r'\{+([^{}]*(?:<<<ESC_[LR]BRACE>>>[^{}]*)*)\}+'
-            
             def replace_braces(match):
                 full_match = match.group(0)
                 content = match.group(1)
-                
                 left_count = 0
                 i = 0
                 while i < len(full_match) and full_match[i] == '{':
                     left_count += 1
                     i += 1
-                
                 weight = 1.2 ** left_count
                 return f"({content}:{weight:.3f})"
-            
             while re.search(pattern, text):
                 text = re.sub(pattern, replace_braces, text)
             return text
@@ -642,18 +423,13 @@ class NewBieCLIP:
             text = [text]
 
         self._last_text = text
-
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to(self.original_device)
-            self.clip_model = self.clip_model.to(self.original_device)
+        self._move_to_device()
 
         with torch.no_grad():
-            # Use original_text for CLIP if provided, otherwise use text
             clip_text = original_text if original_text is not None else text
             if isinstance(clip_text, str):
                 clip_text = [clip_text]
 
-            # Gemma processes full text with system prompt
             tokens = self.tokenizer(
                 text,
                 return_tensors="pt",
@@ -668,37 +444,27 @@ class NewBieCLIP:
             gemma_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
             cap_feats = gemma_outputs.hidden_states[-2]
 
-            # CLIP processes only the original user prompt
             clip_inputs = self.clip_tokenizer(clip_text, return_tensors="pt", padding=True, truncation=True, max_length=8000).to(self.device)
-            # Get pooled features - hook will capture hidden states if needed
-            clip_text_embeddings = None  # Will be set by hook if available
             clip_text_pooled = self.clip_model.get_text_features(input_ids=clip_inputs.input_ids)
 
             extra_conds = {
                 "cap_feats": cap_feats,
                 "cap_mask": attention_mask,
                 "clip_text_pooled": clip_text_pooled,
+                "pooled_output": clip_text_pooled,
             }
 
             result = [[cap_feats, extra_conds]]
 
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to("cpu")
-            self.clip_model = self.clip_model.to("cpu")
-            torch.cuda.empty_cache()
-
+        self._move_to_cpu()
         return result
 
     def _encode_text_direct_weighted(self, text, original_text=None):
-        """Enhanced version that returns CLIP embeddings for weight processing"""
         if isinstance(text, str):
             text = [text]
 
         self._last_text = text
-
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to(self.original_device)
-            self.clip_model = self.clip_model.to(self.original_device)
+        self._move_to_device()
 
         with torch.no_grad():
             clip_text = original_text if original_text is not None else text
@@ -720,20 +486,11 @@ class NewBieCLIP:
             cap_feats = gemma_outputs.hidden_states[-2]
 
             clip_inputs = self.clip_tokenizer(clip_text, return_tensors="pt", padding=True, truncation=True, max_length=8000).to(self.device)
-
-            clip_text_embeddings = None
-
-            if self.enable_jina_weights:
-                if hasattr(self.clip_model, '_last_hidden_states'):
-                    self.clip_model._last_hidden_states = None
-
             clip_text_pooled = self.clip_model.get_text_features(input_ids=clip_inputs.input_ids)
-
+            
+            clip_text_embeddings = None
             if self.enable_jina_weights and hasattr(self.clip_model, '_last_hidden_states') and self.clip_model._last_hidden_states is not None:
                 clip_text_embeddings = self.clip_model._last_hidden_states
-                print(f"[NewbieCLIP] Jina CLIP: Using hook to capture token embeddings, shape={clip_text_embeddings.shape}")
-            elif not self.enable_jina_weights:
-                print(f"[NewbieCLIP] Jina权重处理已禁用")
 
             extra_conds = {
                 "cap_feats": cap_feats,
@@ -744,30 +501,21 @@ class NewBieCLIP:
 
             result = [[cap_feats, extra_conds]]
 
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to("cpu")
-            self.clip_model = self.clip_model.to("cpu")
-            torch.cuda.empty_cache()
-
+        self._move_to_cpu()
         return result
 
     def _encode_text_direct_weighted_with_offsets(self, text, char_weights, original_text=None):
-        """Enhanced version with offset mapping for precise weight alignment"""
         if isinstance(text, str):
             text = [text]
 
         self._last_text = text
-
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to(self.original_device)
-            self.clip_model = self.clip_model.to(self.original_device)
+        self._move_to_device()
 
         with torch.no_grad():
             clip_text = original_text if original_text is not None else text
             if isinstance(clip_text, str):
                 clip_text = [clip_text]
 
-            # Tokenize with offset mapping for Gemma
             tokens = self.tokenizer(
                 text,
                 return_tensors="pt",
@@ -780,7 +528,6 @@ class NewBieCLIP:
             input_ids = tokens.input_ids.to(self.device)
             attention_mask = tokens.attention_mask.to(self.device)
 
-            # Align weights using offset mapping for Gemma
             gemma_token_weights = None
             if hasattr(tokens, 'offset_mapping') and tokens.offset_mapping is not None:
                 gemma_token_weights = self._align_weights_with_offsets(
@@ -788,11 +535,9 @@ class NewBieCLIP:
                 )
                 print(f"[NewbieCLIP] Gemma: 对齐了{len(gemma_token_weights)}个token权重")
 
-            # Process Gemma
             gemma_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
             cap_feats = gemma_outputs.hidden_states[-2]
 
-            # Tokenize with offset mapping for CLIP
             clip_inputs = self.clip_tokenizer(
                 clip_text,
                 return_tensors="pt",
@@ -802,7 +547,6 @@ class NewBieCLIP:
                 return_offsets_mapping=True
             ).to(self.device)
 
-            # Align weights for CLIP
             clip_token_weights = None
             if hasattr(clip_inputs, 'offset_mapping') and clip_inputs.offset_mapping is not None:
                 clip_token_weights = self._align_weights_with_offsets(
@@ -811,11 +555,6 @@ class NewBieCLIP:
                 print(f"[NewbieCLIP] Jina CLIP: 对齐了{len(clip_token_weights)}个token权重")
 
             clip_text_embeddings = None
-
-            if self.enable_jina_weights:
-                if hasattr(self.clip_model, '_last_hidden_states'):
-                    self.clip_model._last_hidden_states = None
-
             clip_text_pooled = self.clip_model.get_text_features(input_ids=clip_inputs.input_ids)
 
             if self.enable_jina_weights and hasattr(self.clip_model, '_last_hidden_states') and self.clip_model._last_hidden_states is not None:
@@ -831,28 +570,20 @@ class NewBieCLIP:
                 "clip_token_weights": clip_token_weights
             }
 
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to("cpu")
-            self.clip_model = self.clip_model.to("cpu")
-            torch.cuda.empty_cache()
-
+        self._move_to_cpu()
         return result
 
     def _align_weights_with_offsets(self, offset_mapping, char_weights, text):
-        """Align character-level weights to token-level using offset mapping"""
         token_weights = []
-
         for token_start, token_end in offset_mapping:
-            if token_start == token_end:  # Special tokens like [PAD]
+            if token_start == token_end:
                 token_weights.append(1.0)
                 continue
 
-            # Find overlapping weight spans
             weight_sum = 0.0
             overlap_sum = 0
 
             for char_start, char_end, weight in char_weights:
-                # Calculate overlap between token span and weight span
                 overlap_start = max(token_start, char_start)
                 overlap_end = min(token_end, char_end)
 
@@ -861,33 +592,27 @@ class NewBieCLIP:
                     weight_sum += weight * overlap_len
                     overlap_sum += overlap_len
 
-            # Average weight for the token based on character overlap
             if overlap_sum > 0:
                 token_weights.append(weight_sum / overlap_sum)
             else:
-                token_weights.append(1.0)  # Default weight
+                token_weights.append(1.0)
 
         return token_weights
 
     def encode_with_image(self, user_text, image=None, system_text=""):
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to(self.original_device)
-            self.clip_model = self.clip_model.to(self.original_device)
+        self._move_to_device()
         
         if not hasattr(self, 'processor') or self.processor is None:
             return self.encode_text(user_text)
         
         with torch.no_grad():
             if image is not None:
-                # 构建正确的消息格式
                 messages = []
-                
                 if system_text and system_text.strip():
                     messages.append({
                         "role": "system",
                         "content": [{"type": "text", "text": system_text.strip()}]
                     })
-                
                 messages.append({
                     "role": "user",
                     "content": [
@@ -910,7 +635,6 @@ class NewBieCLIP:
                     attention_mask=inputs.attention_mask,
                     output_hidden_states=True,
                 )
-                
                 cap_feats = gemma_outputs.hidden_states[-2]
                 attention_mask = inputs.attention_mask
             else:
@@ -926,8 +650,6 @@ class NewBieCLIP:
             
             text_for_clip = [user_text] if isinstance(user_text, str) else user_text
             clip_inputs = self.clip_tokenizer(text_for_clip, return_tensors="pt", padding=True, truncation=True, max_length=8000).to(self.device)
-            # Get pooled features - hook will capture hidden states if needed
-            clip_text_embeddings = None  # Will be set by hook if available
             clip_text_pooled = self.clip_model.get_text_features(input_ids=clip_inputs.input_ids)
             
             extra_conds = {
@@ -938,20 +660,13 @@ class NewBieCLIP:
             
             result = [[cap_feats, extra_conds]]
         
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to("cpu")
-            self.clip_model = self.clip_model.to("cpu")
-            torch.cuda.empty_cache()
-        
+        self._move_to_cpu()
         return result
 
     def get_clip_features(self, text):
-        if self.cpu_offload:
-            self.clip_model = self.clip_model.to(self.original_device)
-        
+        self._move_to_device()
         if isinstance(text, str):
             text = [text]
-            
         with torch.no_grad():
             clip_inputs = self.clip_tokenizer(
                 text,
@@ -960,15 +675,8 @@ class NewBieCLIP:
                 truncation=True,
                 max_length=8000
             ).to(self.device)
-            
-            # Get pooled features - hook will capture hidden states if needed
-            clip_text_embeddings = None  # Will be set by hook if available
             clip_text_pooled = self.clip_model.get_text_features(input_ids=clip_inputs.input_ids)
-        
-        if self.cpu_offload:
-            self.clip_model = self.clip_model.to("cpu")
-            torch.cuda.empty_cache()
-            
+        self._move_to_cpu()
         return clip_text_pooled
 
 
@@ -1002,9 +710,9 @@ class NewBieCLIPLoader:
                     "default": True,
                     "description": "Enable weight processing for Jina CLIP (requires more memory)"
                 }),
-                "weight_baseline_mode": (["compel", "mean", "empty", "attn_bias", "hybrid"], {
-                    "default": "compel",
-                    "description": "Weight baseline mode: 'compel' for advanced, 'mean' for context-aware, 'empty' for traditional, 'attn_bias' for attention-based, 'hybrid' for combined approach"
+                "weight_baseline_mode": (["mean", "empty", "compel", "attn_bias", "hybrid"], {
+                    "default": "mean",
+                    "description": "Weight baseline mode: 'mean' for context-aware, 'empty' for traditional, 'compel' for advanced, 'attn_bias' for attention-based, 'hybrid' for combined approach"
                 }),
                 "weight_strength": ("FLOAT", {
                     "default": 1.0,
@@ -1034,7 +742,7 @@ class NewBieCLIPLoader:
                 print(f"Loading Gemma model from HuggingFace: {model_path}")
                 text_encoder = AutoModel.from_pretrained(
                     model_path,
-                    torch_dtype=dtype,
+                    dtype=dtype,
                     device_map=device,
                     trust_remote_code=True
                 )
@@ -1059,7 +767,7 @@ class NewBieCLIPLoader:
         try:
             text_encoder = AutoModel.from_pretrained(
                 model_path,
-                torch_dtype=dtype,
+                dtype=dtype,
                 device_map=device,
                 trust_remote_code=True,
                 local_files_only=True,
@@ -1088,7 +796,10 @@ class NewBieCLIPLoader:
             if not os.path.exists(config_path):
                 raise FileNotFoundError(f"config.json not found in {model_path}")
             
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, 
+                trust_remote_code=True
+            )
             tokenizer.padding_side = "right"
             try:
                 processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
@@ -1135,20 +846,48 @@ class NewBieCLIPLoader:
         print(f"Loading Jina CLIP model: {model_path}")
         print(f"Device: {device}, Dtype: {dtype}")
 
-        try:
-            # Standard loading with trust_remote_code
-            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-            config.use_flash_attn = False
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            clip_model = AutoModel.from_pretrained(
-                model_path,
-                config=config,
-                torch_dtype=dtype,
-                device_map=device,
-                trust_remote_code=True
-            )
+        # --- Flash Attention 無効化ハック ---
+        # Jina CLIPのremote codeがflash_attnを強制的にインポートしてクラッシュするのを防ぐため、
+        # 一時的にflash_attnが見つからないふりをするContext Managerを定義
+        import sys
+        class SuppressFlashAttn:
+            def __enter__(self):
+                self.saved_flash = sys.modules.get("flash_attn")
+                self.saved_flash_2 = sys.modules.get("flash_attn.losses.cross_entropy")
+                # flash_attnをNoneに設定してImportErrorを誘発させる
+                sys.modules["flash_attn"] = None
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                # 復元
+                if self.saved_flash is not None:
+                    sys.modules["flash_attn"] = self.saved_flash
+                else:
+                    # 元々ロードされていなければ削除（Noneキーを残さない）
+                    if "flash_attn" in sys.modules:
+                        del sys.modules["flash_attn"]
+                
+                # サブモジュールも念のため復元処理
+                if self.saved_flash_2 is not None:
+                     sys.modules["flash_attn.losses.cross_entropy"] = self.saved_flash_2
 
-            # Add hook to capture hidden states if weight processing is enabled
+        try:
+            with SuppressFlashAttn():
+                config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+                config.use_flash_attn = False
+                
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_path, 
+                    trust_remote_code=True
+                )
+                
+                clip_model = AutoModel.from_pretrained(
+                    model_path,
+                    config=config,
+                    dtype=dtype,
+                    device_map=device,
+                    trust_remote_code=True
+                )
+
             if enable_jina_weights and hasattr(clip_model, 'text_model'):
                 print(f"[NewbieCLIP] Installing hook to capture hidden states")
                 self._install_hidden_state_hook(clip_model, enable_jina_weights)
@@ -1162,7 +901,6 @@ class NewBieCLIPLoader:
             raise
 
     def _install_hidden_state_hook(self, clip_model, enable_jina_weights=True):
-        """Install forward hook to capture hidden states from text_model"""
         if not enable_jina_weights:
             return
 
