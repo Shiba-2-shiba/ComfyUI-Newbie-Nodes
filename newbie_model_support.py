@@ -133,6 +133,8 @@ class NewBieBaseModel(torch.nn.Module):
             model_kwargs['clip_text_pooled'] = clip_text_pooled.to(device=device, dtype=dtype)
         if clip_img_pooled is not None:
             model_kwargs['clip_img_pooled'] = clip_img_pooled.to(device=device, dtype=dtype)
+            
+        model_kwargs['transformer_options'] = transformer_options
 
         # Ensure diffusion_model is on the correct device before forward pass
         self.diffusion_model.to(device)
