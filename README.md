@@ -107,7 +107,7 @@ If you are using the **bundled `newbie` calibration** (Quick start above), you o
 2. In the red box field **`manual_model_name`**, type your model name (example: `newbie`).
 3. Run once to generate calibration data.
 
-![Calibrate MagCache - manual_model_name](magcache_newbie_data/img2.png)
+![Calibrate MagCache - manual_model_name](magcache_newbie_data/img1.png)
 
 ---
 
@@ -115,7 +115,7 @@ If you are using the **bundled `newbie` calibration** (Quick start above), you o
 1. Add **MagCache for NewBie** and connect the same `model`.
 2. Set **`manual_model_name`** to the *exact same string* used in Step 1 (example: `newbie`).
 
-![MagCache for NewBie - manual_model_name](magcache_newbie_data/img1.png)
+![MagCache for NewBie - manual_model_name](magcache_newbie_data/img2.png)
 
 ---
 
