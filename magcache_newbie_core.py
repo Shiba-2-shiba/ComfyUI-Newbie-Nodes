@@ -26,12 +26,19 @@ def load_mag_ratios(model_hash: str):
             return None
     return None
 
-def save_mag_ratios(model_hash: str, ratios: list, model_name: str):
+def save_mag_ratios(model_hash: str, ratios: list, model_name: str, stats: dict | None = None):
+    """Save MagCache calibration data.
+
+    Backward compatible: existing callers can pass only (model_hash, ratios, model_name).
+    If stats is provided, it is stored under the 'stats' key in the same JSON.
+    """
     filepath = os.path.join(CALIBRATION_DIR, f"{model_hash}.json")
     data = {
         'model_name': model_name,
-        'mag_ratios': ratios
+        'mag_ratios': ratios,
     }
+    if stats:
+        data['stats'] = stats
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=4)
     print(f"[MagCache-NewBie] Calibration data saved to {filepath}")
@@ -82,7 +89,7 @@ class MagCacheState:
     def get_state(self, guidance_type: str):
         return self.state[guidance_type]
 
-    def store_residual(self, residual_tensor: str, guidance_type: str):
+    def store_residual(self, residual_tensor, guidance_type: str):
         state = self.get_state(guidance_type)
         # NewBieのテンソルはGPUメモリを食う可能性があるため、必要に応じてCPUオフロードも検討可能だが、
         # 高速化のためVRAMに保持する設計を維持
